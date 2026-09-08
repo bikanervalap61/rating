@@ -7,6 +7,7 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from playwright.sync_api import sync_playwright
+from bs4 import BeautifulSoup
 
 BASE_DIR = Path(__file__).parent.resolve()
 
@@ -38,56 +39,105 @@ def dismiss_consent_modal(page):
     except Exception:
         pass
 
-def extract_gmb_data_via_browser(page):
+def parse_with_soup(html_content):
+    """Backup parser using BeautifulSoup on page HTML."""
+    try:
+        soup = BeautifulSoup(html_content, "html.parser")
+        
+        # 1. Google Maps check
+        f7 = soup.find(class_=re.compile(r"F7nice"))
+        if f7:
+            r = None
+            rev = None
+            span_r = f7.find("span", attrs={"aria-hidden": "true"})
+            if span_r and re.match(r"^\d\.\d$", span_r.text.strip()):
+                r = float(span_r.text.strip())
+            aria_rev = f7.find(attrs={"aria-label": re.compile(r"([\d,]+)\s*reviews?")})
+            if aria_rev:
+                m = re.search(r"([\d,]+)\s*reviews?", aria_rev["aria-label"])
+                if m:
+                    rev = int(m.group(1).replace(",", ""))
+            if not rev:
+                m_paren = re.search(r"\(\s*([\d,]+)\s*\)", f7.text)
+                if m_paren:
+                    rev = int(m_paren.group(1).replace(",", ""))
+            if r is not None and rev is not None:
+                return r, rev
+
+        # 2. Google Knowledge Graph check
+        rev_nodes = soup.find_all(string=re.compile(r"([\d,]+)\s*Google\s*reviews?", re.I))
+        for node in rev_nodes:
+            m = re.search(r"([\d,]+)\s*Google\s*reviews?", node, re.I)
+            if m:
+                rev = int(m.group(1).replace(",", ""))
+                block = node.find_parent(attrs={"data-attrid": re.compile(r"place_ratings")}) or \
+                        node.find_parent(class_=re.compile(r"Ob27yc")) or \
+                        node.parent.parent
+                r = None
+                if block:
+                    aria = block.find(attrs={"aria-label": re.compile(r"Rated\s*(\d\.\d)\s*out of 5", re.I)})
+                    if aria:
+                        r = float(re.search(r"Rated\s*(\d\.\d)\s*out of 5", aria["aria-label"], re.I).group(1))
+                    if r is None:
+                        for tag in block.find_all(["span", "div"]):
+                            txt = tag.text.strip()
+                            if re.match(r"^\d\.\d$", txt):
+                                candidate = float(txt)
+                                if 1.0 <= candidate <= 5.0:
+                                    r = candidate
+                                    break
+                if r is not None and rev is not None:
+                    return r, rev
+    except Exception as e:
+        print(f"    [Soup fallback error] {e}")
+
+    return None, None
+
+def extract_gmb_data(page):
     """
-    Executes targeted JavaScript in browser context to isolate ONLY the official
-    Google Business Profile rating block.
-    Guarantees that 3rd-party platforms (Zomato, Swiggy, TripAdvisor, Justdial)
-    and 'Reviews from the web' sections are completely excluded.
+    Extracts strictly the official Google Business Profile rating and review count.
+    Primary: In-browser DOM traversal via JavaScript.
+    Secondary: BeautifulSoup parser on page HTML.
     """
     dismiss_consent_modal(page)
 
     js_code = r"""
     () => {
-        // --- 1. Check Google Maps Panel (e.g. maps.google.com) ---
+        // --- 1. Check Google Maps Panel ---
         const f7 = document.querySelector('div.F7nice');
         if (f7) {
             let r = null;
             let rev = null;
 
-            // Rating in Google Maps
             const rSpan = f7.querySelector('span[aria-hidden="true"]');
-            if (rSpan && /^\\d\\.\\d$/.test(rSpan.innerText.trim())) {
+            if (rSpan && /^\d\.\d$/.test(rSpan.innerText.trim())) {
                 r = parseFloat(rSpan.innerText.trim());
             }
 
-            // Reviews in Google Maps
             const ariaRev = f7.querySelector('[aria-label*="reviews"]');
             if (ariaRev) {
                 const label = ariaRev.getAttribute('aria-label') || '';
-                const m = label.match(/([\\d,]+)\\s*reviews?/i);
+                const m = label.match(/([\d,]+)\s*reviews?/i);
                 if (m) rev = parseInt(m[1].replace(/,/g, ''), 10);
             }
             if (!rev) {
-                const mParen = f7.innerText.match(/\\(\\s*([\\d,]+)\\s*\\)/);
+                const mParen = f7.innerText.match(/\(\s*([\d,]+)\s*\)/);
                 if (mParen) rev = parseInt(mParen[1].replace(/,/g, ''), 10);
             }
 
             if (r !== null && rev !== null) {
-                return { rating: r, reviews: rev, method: 'google_maps' };
+                return { rating: r, reviews: rev, method: 'maps' };
             }
         }
 
         // --- 2. Google Search Knowledge Graph ---
-        // Locate the text node explicitly saying "Google reviews"
-        // This is unique to Google Business Profile and never used by 3rd parties
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
         let revNode = null;
         let revCount = null;
 
         while (walker.nextNode()) {
             const text = walker.currentNode.nodeValue;
-            const m = text.match(/([\\d,]+)\\s*Google\\s*reviews?/i);
+            const m = text.match(/([\d,]+)\s*Google\s*reviews?/i);
             if (m) {
                 revCount = parseInt(m[1].replace(/,/g, ''), 10);
                 revNode = walker.currentNode.parentElement;
@@ -96,11 +146,8 @@ def extract_gmb_data_via_browser(page):
         }
 
         if (revNode && revCount !== null) {
-            // Find the immediate rating container enclosing this Google reviews link
-            // Specifically: data-attrid="kc:/local:place_ratings" or class "Ob27yc"
             let block = revNode.closest('[data-attrid*="place_ratings"], .Ob27yc');
             if (!block) {
-                // Fallback to closest parent container (up to 3 levels)
                 let p = revNode.parentElement;
                 for (let i = 0; i < 3 && p; i++) {
                     if (p.querySelector('[aria-label*="Rated"], [aria-label*="out of 5"], span.aqN8e, span.yi40Hd')) {
@@ -116,30 +163,30 @@ def extract_gmb_data_via_browser(page):
 
             let rating = null;
 
-            // 2a. Check aria-label inside this block (e.g. 'Rated 4.3 out of 5,')
+            // Check aria-label
             const ariaEl = block.querySelector('[aria-label*="Rated"], [aria-label*="out of 5"]');
             if (ariaEl) {
                 const label = ariaEl.getAttribute('aria-label') || '';
-                const mRate = label.match(/Rated\\s*(\\d\\.\\d)\\s*out of 5/i) || label.match(/(\\d\\.\\d)\\s*out of 5/i);
+                const mRate = label.match(/Rated\s*(\d\.\d)\s*out of 5/i) || label.match(/(\d\.\d)\s*out of 5/i);
                 if (mRate) {
                     rating = parseFloat(mRate[1]);
                 }
             }
 
-            // 2b. Check specific GMB rating spans: aqN8e, yi40Hd, FZ1T5
+            // Check GMB specific rating classes
             if (rating === null) {
                 const rateSpan = block.querySelector('span.aqN8e, span.yi40Hd, span.FZ1T5');
-                if (rateSpan && /^\\d\\.\\d$/.test(rateSpan.innerText.trim())) {
+                if (rateSpan && /^\d\.\d$/.test(rateSpan.innerText.trim())) {
                     rating = parseFloat(rateSpan.innerText.trim());
                 }
             }
 
-            // 2c. Check any child span in this immediate block with exact format \d\.\d
+            // Check any child element matching exact format \d\.\d
             if (rating === null) {
                 const spans = block.querySelectorAll('span, div');
                 for (const s of spans) {
                     const txt = s.innerText ? s.innerText.trim() : '';
-                    if (/^\\d\\.\\d$/.test(txt)) {
+                    if (/^\d\.\d$/.test(txt)) {
                         const val = parseFloat(txt);
                         if (val >= 1.0 && val <= 5.0) {
                             rating = val;
@@ -149,16 +196,16 @@ def extract_gmb_data_via_browser(page):
                 }
             }
 
-            // 2d. Check text pattern inside this immediate block: "4.3 ... 15,615 Google reviews"
+            // Check text pattern inside immediate block: "4.3 ... 15,615 Google reviews"
             if (rating === null) {
                 const blockText = block.innerText || '';
-                const mPattern = blockText.match(/(\\d\\.\\d)\\s*[\\r\\n\\s]*★*[\\r\\n\\s]*[\\d,]+\\s*Google\\s*reviews?/i);
+                const mPattern = blockText.match(/(\d\.\d)\s*[\r\n\s]*★*[\r\n\s]*[\d,]+\s*Google\s*reviews?/i);
                 if (mPattern) {
                     rating = parseFloat(mPattern[1]);
                 }
             }
 
-            return { rating: rating, reviews: revCount, method: 'knowledge_graph_targeted' };
+            return { rating: rating, reviews: revCount, method: 'knowledge_graph' };
         }
 
         return { rating: null, reviews: null, method: 'none' };
@@ -167,10 +214,17 @@ def extract_gmb_data_via_browser(page):
 
     try:
         data = page.evaluate(js_code)
-        return data.get("rating"), data.get("reviews")
+        if data and data.get("rating") is not None and data.get("reviews") is not None:
+            return data["rating"], data["reviews"]
     except Exception as e:
         print(f"    [Evaluate error] {e}")
-        return None, None
+
+    # Fallback to BeautifulSoup parser
+    r_soup, rev_soup = parse_with_soup(page.content())
+    if r_soup is not None and rev_soup is not None:
+        return r_soup, rev_soup
+
+    return None, None
 
 def scrape_store(page, store_code, brand, address, link):
     print(f"\n[Scraping] {store_code} - {brand} ({address})")
@@ -184,7 +238,7 @@ def scrape_store(page, store_code, brand, address, link):
     try:
         page.goto(link, timeout=40000, wait_until="domcontentloaded")
         page.wait_for_timeout(3500)
-        rating, reviews = extract_gmb_data_via_browser(page)
+        rating, reviews = extract_gmb_data(page)
     except Exception as e:
         error_msg = str(e)
         print(f"  [Direct link warning] {e}")
@@ -198,7 +252,7 @@ def scrape_store(page, store_code, brand, address, link):
         try:
             page.goto(search_url, timeout=40000, wait_until="domcontentloaded")
             page.wait_for_timeout(3500)
-            f_rating, f_reviews = extract_gmb_data_via_browser(page)
+            f_rating, f_reviews = extract_gmb_data(page)
             if f_rating is not None and rating is None:
                 rating = f_rating
             if f_reviews is not None and reviews is None:
