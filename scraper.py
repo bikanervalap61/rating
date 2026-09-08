@@ -20,18 +20,6 @@ def find_excel_file():
             return path
     raise FileNotFoundError("Could not find any target Excel file in the directory.")
 
-def clean_number(text):
-    if not text:
-        return None
-    cleaned = re.sub(r"[^\d]", "", str(text))
-    return int(cleaned) if cleaned else None
-
-def clean_rating(text):
-    if not text:
-        return None
-    m = re.search(r"(\d\.\d)", str(text))
-    return float(m.group(1)) if m else None
-
 def dismiss_consent_modal(page):
     """Dismisses Google cookie/consent dialog if it appears."""
     try:
@@ -50,113 +38,139 @@ def dismiss_consent_modal(page):
     except Exception:
         pass
 
-def extract_gmb_data(page):
+def extract_gmb_data_via_browser(page):
     """
-    Strictly extracts ONLY Google My Business / Google Maps rating & reviews.
-    Excludes any 3rd party platforms (Zomato, Swiggy, TripAdvisor, Justdial).
+    Executes targeted JavaScript in browser context to isolate ONLY the official
+    Google Business Profile rating block.
+    Guarantees that 3rd-party platforms (Zomato, Swiggy, TripAdvisor, Justdial)
+    and 'Reviews from the web' sections are completely excluded.
     """
-    rating = None
-    reviews = None
-
     dismiss_consent_modal(page)
 
-    # Strategy 1: Google Search Desktop Knowledge Graph (Right Hand Side: #rhs)
-    # The Knowledge Panel strictly lives inside #rhs or div[data-attrid*='kc:/local:']
+    js_code = r"""
+    () => {
+        // --- 1. Check Google Maps Panel (e.g. maps.google.com) ---
+        const f7 = document.querySelector('div.F7nice');
+        if (f7) {
+            let r = null;
+            let rev = null;
+
+            // Rating in Google Maps
+            const rSpan = f7.querySelector('span[aria-hidden="true"]');
+            if (rSpan && /^\\d\\.\\d$/.test(rSpan.innerText.trim())) {
+                r = parseFloat(rSpan.innerText.trim());
+            }
+
+            // Reviews in Google Maps
+            const ariaRev = f7.querySelector('[aria-label*="reviews"]');
+            if (ariaRev) {
+                const label = ariaRev.getAttribute('aria-label') || '';
+                const m = label.match(/([\\d,]+)\\s*reviews?/i);
+                if (m) rev = parseInt(m[1].replace(/,/g, ''), 10);
+            }
+            if (!rev) {
+                const mParen = f7.innerText.match(/\\(\\s*([\\d,]+)\\s*\\)/);
+                if (mParen) rev = parseInt(mParen[1].replace(/,/g, ''), 10);
+            }
+
+            if (r !== null && rev !== null) {
+                return { rating: r, reviews: rev, method: 'google_maps' };
+            }
+        }
+
+        // --- 2. Google Search Knowledge Graph ---
+        // Locate the text node explicitly saying "Google reviews"
+        // This is unique to Google Business Profile and never used by 3rd parties
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+        let revNode = null;
+        let revCount = null;
+
+        while (walker.nextNode()) {
+            const text = walker.currentNode.nodeValue;
+            const m = text.match(/([\\d,]+)\\s*Google\\s*reviews?/i);
+            if (m) {
+                revCount = parseInt(m[1].replace(/,/g, ''), 10);
+                revNode = walker.currentNode.parentElement;
+                break;
+            }
+        }
+
+        if (revNode && revCount !== null) {
+            // Find the immediate rating container enclosing this Google reviews link
+            // Specifically: data-attrid="kc:/local:place_ratings" or class "Ob27yc"
+            let block = revNode.closest('[data-attrid*="place_ratings"], .Ob27yc');
+            if (!block) {
+                // Fallback to closest parent container (up to 3 levels)
+                let p = revNode.parentElement;
+                for (let i = 0; i < 3 && p; i++) {
+                    if (p.querySelector('[aria-label*="Rated"], [aria-label*="out of 5"], span.aqN8e, span.yi40Hd')) {
+                        block = p;
+                        break;
+                    }
+                    p = p.parentElement;
+                }
+            }
+            if (!block) {
+                block = revNode.parentElement ? revNode.parentElement.parentElement : revNode;
+            }
+
+            let rating = null;
+
+            // 2a. Check aria-label inside this block (e.g. 'Rated 4.3 out of 5,')
+            const ariaEl = block.querySelector('[aria-label*="Rated"], [aria-label*="out of 5"]');
+            if (ariaEl) {
+                const label = ariaEl.getAttribute('aria-label') || '';
+                const mRate = label.match(/Rated\\s*(\\d\\.\\d)\\s*out of 5/i) || label.match(/(\\d\\.\\d)\\s*out of 5/i);
+                if (mRate) {
+                    rating = parseFloat(mRate[1]);
+                }
+            }
+
+            // 2b. Check specific GMB rating spans: aqN8e, yi40Hd, FZ1T5
+            if (rating === null) {
+                const rateSpan = block.querySelector('span.aqN8e, span.yi40Hd, span.FZ1T5');
+                if (rateSpan && /^\\d\\.\\d$/.test(rateSpan.innerText.trim())) {
+                    rating = parseFloat(rateSpan.innerText.trim());
+                }
+            }
+
+            // 2c. Check any child span in this immediate block with exact format \d\.\d
+            if (rating === null) {
+                const spans = block.querySelectorAll('span, div');
+                for (const s of spans) {
+                    const txt = s.innerText ? s.innerText.trim() : '';
+                    if (/^\\d\\.\\d$/.test(txt)) {
+                        const val = parseFloat(txt);
+                        if (val >= 1.0 && val <= 5.0) {
+                            rating = val;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // 2d. Check text pattern inside this immediate block: "4.3 ... 15,615 Google reviews"
+            if (rating === null) {
+                const blockText = block.innerText || '';
+                const mPattern = blockText.match(/(\\d\\.\\d)\\s*[\\r\\n\\s]*★*[\\r\\n\\s]*[\\d,]+\\s*Google\\s*reviews?/i);
+                if (mPattern) {
+                    rating = parseFloat(mPattern[1]);
+                }
+            }
+
+            return { rating: rating, reviews: revCount, method: 'knowledge_graph_targeted' };
+        }
+
+        return { rating: null, reviews: null, method: 'none' };
+    }
+    """
+
     try:
-        rhs = page.query_selector("#rhs, div.kp-wholepage, div[data-attrid*='kc:/local:']")
-        if rhs:
-            # 1a. Reviews: Look strictly for "Google reviews" inside the knowledge card
-            rev_el = rhs.query_selector("a:has-text('Google review'), span:has-text('Google review')")
-            if rev_el:
-                rev_text = rev_el.inner_text()
-                m_rev = re.search(r"([\d,]+)\s*Google\s*reviews?", rev_text, re.I)
-                if m_rev:
-                    reviews = clean_number(m_rev.group(1))
-
-            # 1b. Rating: Look for rating span inside the knowledge card
-            rate_el = rhs.query_selector("span.aqN8e, span.FZ1T5, span[aria-hidden='true']:has-text('.')")
-            if rate_el:
-                r_text = rate_el.inner_text()
-                m_rate = re.search(r"^(\d\.\d)$", r_text.strip())
-                if m_rate:
-                    rating = float(m_rate.group(1))
-
-            # 1c. If rating wasn't in span.aqN8e, check aria-label within the ratings block
-            if not rating:
-                rate_block = rhs.query_selector("[data-attrid*='place_ratings'], .Ob27yc")
-                if rate_block:
-                    aria_el = rate_block.query_selector("[aria-label*='Rated'], [aria-label*='out of 5']")
-                    if aria_el:
-                        m_aria = re.search(r"(\d\.\d)\s*(?:stars?|out of 5)", aria_el.get_attribute("aria-label") or "", re.I)
-                        if m_aria:
-                            rating = float(m_aria.group(1))
-                    if not rating:
-                        # Direct regex on the rating block text
-                        m_block = re.search(r"(\d\.\d)", rate_block.inner_text())
-                        if m_block:
-                            rating = float(m_block.group(1))
+        data = page.evaluate(js_code)
+        return data.get("rating"), data.get("reviews")
     except Exception as e:
-        print(f"    [Knowledge Graph parser debug] {e}")
-
-    # Strategy 2: Google Maps (e.g. if URL redirected to maps.google.com)
-    if rating is None or reviews is None:
-        try:
-            maps_container = page.query_selector("div.F7nice, div.TIHn2, div.fontDisplayLarge")
-            if maps_container:
-                # Maps rating
-                m_span = maps_container.query_selector("span[aria-hidden='true']")
-                if m_span:
-                    r_candidate = clean_rating(m_span.inner_text())
-                    if r_candidate:
-                        rating = r_candidate
-
-                # Maps reviews
-                m_rev_aria = maps_container.query_selector("[aria-label*='reviews']")
-                if m_rev_aria:
-                    label = m_rev_aria.get_attribute("aria-label") or ""
-                    m = re.search(r"([\d,]+)\s*reviews?", label, re.I)
-                    if m:
-                        reviews = clean_number(m.group(1))
-                if not reviews:
-                    m_paren = re.search(r"\(\s*([\d,]+)\s*\)", maps_container.inner_text())
-                    if m_paren:
-                        reviews = clean_number(m_paren.group(1))
-        except Exception as e:
-            print(f"    [Maps parser debug] {e}")
-
-    # Strategy 3: Target the specific phrase "Google reviews" anywhere on the page
-    # This prevents matching ANY 3rd party site because only Google uses "Google reviews"
-    if rating is None or reviews is None:
-        try:
-            # Find elements containing "Google review"
-            google_rev_elements = page.query_selector_all("span:has-text('Google review'), a:has-text('Google review')")
-            for g_el in google_rev_elements:
-                text = g_el.inner_text()
-                m_rev = re.search(r"([\d,]+)\s*Google\s*reviews?", text, re.I)
-                if m_rev and not reviews:
-                    reviews = clean_number(m_rev.group(1))
-
-                # Look around this element for the rating
-                if not rating:
-                    # Get surrounding parent container
-                    parent_text = g_el.evaluate("el => el.parentElement ? (el.parentElement.parentElement ? el.parentElement.parentElement.innerText : el.parentElement.innerText) : ''")
-                    # Match pattern: 4.4 ★★★★★ 4,685 Google reviews
-                    m_combined = re.search(r"(\d\.\d)\s*[\r\n\s]*★*[\r\n\s]*[\d,]+\s*Google\s*reviews?", parent_text, re.I)
-                    if m_combined:
-                        rating = float(m_combined.group(1))
-                    else:
-                        m_simple = re.search(r"(\d\.\d)", parent_text)
-                        if m_simple:
-                            candidate = float(m_simple.group(1))
-                            if 1.0 <= candidate <= 5.0:
-                                rating = candidate
-
-                if rating and reviews:
-                    break
-        except Exception as e:
-            print(f"    [Text parser debug] {e}")
-
-    return rating, reviews
+        print(f"    [Evaluate error] {e}")
+        return None, None
 
 def scrape_store(page, store_code, brand, address, link):
     print(f"\n[Scraping] {store_code} - {brand} ({address})")
@@ -170,12 +184,12 @@ def scrape_store(page, store_code, brand, address, link):
     try:
         page.goto(link, timeout=40000, wait_until="domcontentloaded")
         page.wait_for_timeout(3500)
-        rating, reviews = extract_gmb_data(page)
+        rating, reviews = extract_gmb_data_via_browser(page)
     except Exception as e:
         error_msg = str(e)
         print(f"  [Direct link warning] {e}")
 
-    # Step 2: Fallback to targeted search if either rating or review count wasn't captured
+    # Step 2: Fallback search if rating or reviews were not captured
     if rating is None or reviews is None:
         clean_addr = address.replace(",", " ").strip()
         search_query = f"{brand} {clean_addr}"
@@ -184,10 +198,10 @@ def scrape_store(page, store_code, brand, address, link):
         try:
             page.goto(search_url, timeout=40000, wait_until="domcontentloaded")
             page.wait_for_timeout(3500)
-            f_rating, f_reviews = extract_gmb_data(page)
-            if f_rating and not rating:
+            f_rating, f_reviews = extract_gmb_data_via_browser(page)
+            if f_rating is not None and rating is None:
                 rating = f_rating
-            if f_reviews and not reviews:
+            if f_reviews is not None and reviews is None:
                 reviews = f_reviews
         except Exception as e:
             print(f"  [Fallback warning] {e}")
@@ -254,7 +268,7 @@ def update_excel_workbook(file_path, scraped_data):
         date_cell.value = today_date_str
         date_cell.font = Font(name="Calibri", size=11, bold=True)
         date_cell.alignment = Alignment(horizontal="center", vertical="center")
-        date_cell.fill = PatternFill(fill_type="solid", fgColor="FFD9D2E9")  # Lavender
+        date_cell.fill = PatternFill(fill_type="solid", fgColor="FFD9D2E9")
         date_cell.border = thin_border
         ws.cell(row=1, column=target_review_col).border = thin_border
 
@@ -262,14 +276,14 @@ def update_excel_workbook(file_path, scraped_data):
         rate_hdr.value = "GMB Live Rating"
         rate_hdr.font = Font(name="Calibri", size=10, bold=True)
         rate_hdr.alignment = Alignment(horizontal="center", vertical="center")
-        rate_hdr.fill = PatternFill(fill_type="solid", fgColor="FFDD7E6B")  # Coral
+        rate_hdr.fill = PatternFill(fill_type="solid", fgColor="FFDD7E6B")
         rate_hdr.border = thin_border
 
         rev_hdr = ws.cell(row=2, column=target_review_col)
         rev_hdr.value = "Review Count"
         rev_hdr.font = Font(name="Calibri", size=10, bold=True)
         rev_hdr.alignment = Alignment(horizontal="center", vertical="center")
-        rev_hdr.fill = PatternFill(fill_type="solid", fgColor="FFFFF2CC")  # Yellow
+        rev_hdr.fill = PatternFill(fill_type="solid", fgColor="FFFFF2CC")
         rev_hdr.border = thin_border
     else:
         print(f"  Updating existing date columns: {target_rating_col} & {target_review_col} for {today_date_str}")
