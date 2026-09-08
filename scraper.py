@@ -7,7 +7,11 @@ from pathlib import Path
 import openpyxl
 from openpyxl.styles import Font, Alignment, PatternFill, Border, Side
 from playwright.sync_api import sync_playwright
-from bs4 import BeautifulSoup
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
 
 BASE_DIR = Path(__file__).parent.resolve()
 
@@ -39,57 +43,40 @@ def dismiss_consent_modal(page):
     except Exception:
         pass
 
-def parse_with_soup(html_content):
-    """Backup parser using BeautifulSoup on page HTML."""
+def parse_with_regex_fallback(html_content):
+    """Pure regex fallback using standard library only."""
     try:
-        soup = BeautifulSoup(html_content, "html.parser")
-        
-        # 1. Google Maps check
-        f7 = soup.find(class_=re.compile(r"F7nice"))
-        if f7:
-            r = None
-            rev = None
-            span_r = f7.find("span", attrs={"aria-hidden": "true"})
-            if span_r and re.match(r"^\d\.\d$", span_r.text.strip()):
-                r = float(span_r.text.strip())
-            aria_rev = f7.find(attrs={"aria-label": re.compile(r"([\d,]+)\s*reviews?")})
-            if aria_rev:
-                m = re.search(r"([\d,]+)\s*reviews?", aria_rev["aria-label"])
-                if m:
-                    rev = int(m.group(1).replace(",", ""))
-            if not rev:
-                m_paren = re.search(r"\(\s*([\d,]+)\s*\)", f7.text)
-                if m_paren:
-                    rev = int(m_paren.group(1).replace(",", ""))
-            if r is not None and rev is not None:
-                return r, rev
+        # Maps check
+        m_maps_rev = re.search(r'aria-label="([\d,]+)\s*reviews?"', html_content, re.I)
+        m_maps_r = re.search(r'class="[^"]*F7nice[^"]*"[^>]*>.*?aria-hidden="true"[^>]*>(\d\.\d)<', html_content, re.S)
+        if m_maps_r and m_maps_rev:
+            return float(m_maps_r.group(1)), int(m_maps_rev.group(1).replace(",", ""))
 
-        # 2. Google Knowledge Graph check
-        rev_nodes = soup.find_all(string=re.compile(r"([\d,]+)\s*Google\s*reviews?", re.I))
-        for node in rev_nodes:
-            m = re.search(r"([\d,]+)\s*Google\s*reviews?", node, re.I)
-            if m:
-                rev = int(m.group(1).replace(",", ""))
-                block = node.find_parent(attrs={"data-attrid": re.compile(r"place_ratings")}) or \
-                        node.find_parent(class_=re.compile(r"Ob27yc")) or \
-                        node.parent.parent
-                r = None
-                if block:
-                    aria = block.find(attrs={"aria-label": re.compile(r"Rated\s*(\d\.\d)\s*out of 5", re.I)})
-                    if aria:
-                        r = float(re.search(r"Rated\s*(\d\.\d)\s*out of 5", aria["aria-label"], re.I).group(1))
-                    if r is None:
-                        for tag in block.find_all(["span", "div"]):
-                            txt = tag.text.strip()
-                            if re.match(r"^\d\.\d$", txt):
-                                candidate = float(txt)
-                                if 1.0 <= candidate <= 5.0:
-                                    r = candidate
-                                    break
-                if r is not None and rev is not None:
-                    return r, rev
+        # Google reviews check
+        m_rev = re.search(r'([\d,]+)\s*Google\s*reviews?', html_content, re.I)
+        if m_rev:
+            reviews = int(m_rev.group(1).replace(",", ""))
+            start_pos = max(0, m_rev.start() - 600)
+            end_pos = min(len(html_content), m_rev.end() + 200)
+            snippet = html_content[start_pos:end_pos]
+            
+            m_rated = re.search(r'Rated\s*(\d\.\d)\s*out of 5', snippet, re.I)
+            if m_rated:
+                return float(m_rated.group(1)), reviews
+
+            m_span = re.search(r'aria-hidden="true"[^>]*>(\d\.\d)<', snippet)
+            if m_span:
+                return float(m_span.group(1)), reviews
+
+            m_simple = re.search(r'>(\d\.\d)<', snippet)
+            if m_simple:
+                candidate = float(m_simple.group(1))
+                if 1.0 <= candidate <= 5.0:
+                    return candidate, reviews
+
+            return None, reviews
     except Exception as e:
-        print(f"    [Soup fallback error] {e}")
+        print(f"    [Regex fallback error] {e}")
 
     return None, None
 
@@ -97,7 +84,7 @@ def extract_gmb_data(page):
     """
     Extracts strictly the official Google Business Profile rating and review count.
     Primary: In-browser DOM traversal via JavaScript.
-    Secondary: BeautifulSoup parser on page HTML.
+    Secondary: Pure regex fallback.
     """
     dismiss_consent_modal(page)
 
@@ -163,7 +150,6 @@ def extract_gmb_data(page):
 
             let rating = null;
 
-            // Check aria-label
             const ariaEl = block.querySelector('[aria-label*="Rated"], [aria-label*="out of 5"]');
             if (ariaEl) {
                 const label = ariaEl.getAttribute('aria-label') || '';
@@ -173,7 +159,6 @@ def extract_gmb_data(page):
                 }
             }
 
-            // Check GMB specific rating classes
             if (rating === null) {
                 const rateSpan = block.querySelector('span.aqN8e, span.yi40Hd, span.FZ1T5');
                 if (rateSpan && /^\d\.\d$/.test(rateSpan.innerText.trim())) {
@@ -181,7 +166,6 @@ def extract_gmb_data(page):
                 }
             }
 
-            // Check any child element matching exact format \d\.\d
             if (rating === null) {
                 const spans = block.querySelectorAll('span, div');
                 for (const s of spans) {
@@ -196,7 +180,6 @@ def extract_gmb_data(page):
                 }
             }
 
-            // Check text pattern inside immediate block: "4.3 ... 15,615 Google reviews"
             if (rating === null) {
                 const blockText = block.innerText || '';
                 const mPattern = blockText.match(/(\d\.\d)\s*[\r\n\s]*★*[\r\n\s]*[\d,]+\s*Google\s*reviews?/i);
@@ -219,10 +202,10 @@ def extract_gmb_data(page):
     except Exception as e:
         print(f"    [Evaluate error] {e}")
 
-    # Fallback to BeautifulSoup parser
-    r_soup, rev_soup = parse_with_soup(page.content())
-    if r_soup is not None and rev_soup is not None:
-        return r_soup, rev_soup
+    # Fallback to pure regex parser
+    r_re, rev_re = parse_with_regex_fallback(page.content())
+    if r_re is not None and rev_re is not None:
+        return r_re, rev_re
 
     return None, None
 
