@@ -2,8 +2,8 @@ name: Daily GMB Rating & Review Tracker
 
 on:
   schedule:
-    # 11:00 AM IST is 05:30 AM UTC
-    - cron: '30 5 * * *'
+    # 11:25 AM IST is 05:55 AM UTC
+    - cron: '55 5 * * *'
   workflow_dispatch: # Allows manual trigger from GitHub Actions tab
 
 permissions:
