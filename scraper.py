@@ -2,6 +2,8 @@ import os
 import re
 import json
 import time
+import random
+import urllib.parse
 from datetime import datetime
 from pathlib import Path
 import openpyxl
@@ -28,13 +30,17 @@ def find_excel_file():
 def dismiss_consent_modal(page):
     """Dismisses Google cookie/consent dialog if it appears."""
     try:
-        consent_buttons = [
+        consent_selectors = [
+            "#L2AGLb",  # Google EU "Accept all" button ID
+            "#W0wltc",  # Google EU "Reject all" button ID
             "button:has-text('Accept all')",
             "button:has-text('I agree')",
             "button:has-text('Accept')",
-            "button[aria-label*='Accept all']"
+            "button:has-text('Agree')",
+            "button[aria-label*='Accept all']",
+            "form[action*='consent'] button"
         ]
-        for selector in consent_buttons:
+        for selector in consent_selectors:
             btn = page.query_selector(selector)
             if btn and btn.is_visible():
                 btn.click()
@@ -46,13 +52,29 @@ def dismiss_consent_modal(page):
 def parse_with_regex_fallback(html_content):
     """Pure regex fallback using standard library only."""
     try:
-        # Maps check
-        m_maps_rev = re.search(r'aria-label="([\d,]+)\s*reviews?"', html_content, re.I)
-        m_maps_r = re.search(r'class="[^"]*F7nice[^"]*"[^>]*>.*?aria-hidden="true"[^>]*>(\d\.\d)<', html_content, re.S)
-        if m_maps_r and m_maps_rev:
-            return float(m_maps_r.group(1)), int(m_maps_rev.group(1).replace(",", ""))
+        rating = None
+        reviews = None
 
-        # Google reviews check
+        # Google Maps aria-label pattern (e.g. 'aria-label="4.4 stars 4,701 Reviews"')
+        m_stars_rev = re.search(r'aria-label="([\d.]+)\s*stars?\s*([\d,]+)\s*reviews?"', html_content, re.I)
+        if m_stars_rev:
+            rating = float(m_stars_rev.group(1))
+            reviews = int(m_stars_rev.group(2).replace(",", ""))
+            return rating, reviews
+
+        # Google Maps F7nice pattern
+        m_maps_r = re.search(r'class="[^"]*F7nice[^"]*"[^>]*>.*?aria-hidden="true"[^>]*>(\d\.\d)<', html_content, re.S)
+        if m_maps_r:
+            rating = float(m_maps_r.group(1))
+
+        m_maps_rev = re.search(r'aria-label="([\d,]+)\s*reviews?"', html_content, re.I)
+        if m_maps_rev:
+            reviews = int(m_maps_rev.group(1).replace(",", ""))
+
+        if rating is not None and reviews is not None:
+            return rating, reviews
+
+        # Google Search reviews check
         m_rev = re.search(r'([\d,]+)\s*Google\s*reviews?', html_content, re.I)
         if m_rev:
             reviews = int(m_rev.group(1).replace(",", ""))
@@ -74,50 +96,86 @@ def parse_with_regex_fallback(html_content):
                 if 1.0 <= candidate <= 5.0:
                     return candidate, reviews
 
-            return None, reviews
+        return rating, reviews
     except Exception as e:
         print(f"    [Regex fallback error] {e}")
 
     return None, None
 
-def extract_gmb_data(page):
+def clean_address(addr):
+    """Clean and standardize address, e.g. Sector29 -> Sector 29, Sec-14 -> Sec 14."""
+    s = re.sub(r'([a-zA-Z]+)(\d+)', r'\1 \2', addr)
+    s = re.sub(r'(\d+)([a-zA-Z]+)', r'\1 \2', s)
+    s = s.replace(",", " ").replace("-", " ")
+    return " ".join(s.split())
+
+def extract_gmb_data(page, brand="Bikanervala"):
     """
     Extracts strictly the official Google Business Profile rating and review count.
-    Primary: In-browser DOM traversal via JavaScript.
-    Secondary: Pure regex fallback.
+    Validates that the listing actually belongs to the specified brand to avoid 3rd-party/competitor data.
     """
     dismiss_consent_modal(page)
 
     js_code = r"""
-    () => {
-        // --- 1. Check Google Maps Panel ---
-        const f7 = document.querySelector('div.F7nice');
-        if (f7) {
-            let r = null;
-            let rev = null;
+    (brandName) => {
+        const brandLower = (brandName || '').toLowerCase();
 
-            const rSpan = f7.querySelector('span[aria-hidden="true"]');
-            if (rSpan && /^\d\.\d$/.test(rSpan.innerText.trim())) {
-                r = parseFloat(rSpan.innerText.trim());
+        // --- 1. Directly on Place Page (e.g. h1.DUwDvf) ---
+        const mainTitleEl = document.querySelector('h1.DUwDvf, .fontHeadlineLarge');
+        if (mainTitleEl && (!brandLower || mainTitleEl.innerText.toLowerCase().includes(brandLower))) {
+            const f7 = document.querySelector('div.F7nice');
+            let r = null, rev = null;
+            if (f7) {
+                const rSpan = f7.querySelector('span[aria-hidden="true"], span.MW4etd');
+                if (rSpan && /^\d\.\d$/.test(rSpan.innerText.trim())) r = parseFloat(rSpan.innerText.trim());
+                const ariaRev = f7.querySelector('[aria-label*="reviews"]');
+                if (ariaRev) {
+                    const m = ariaRev.getAttribute('aria-label').match(/([\d,]+)\s*reviews?/i);
+                    if (m) rev = parseInt(m[1].replace(/,/g, ''), 10);
+                }
+                if (!rev) {
+                    const mP = f7.innerText.match(/\(\s*([\d,]+)\s*\)/);
+                    if (mP) rev = parseInt(mP[1].replace(/,/g, ''), 10);
+                }
             }
-
-            const ariaRev = f7.querySelector('[aria-label*="reviews"]');
-            if (ariaRev) {
-                const label = ariaRev.getAttribute('aria-label') || '';
-                const m = label.match(/([\d,]+)\s*reviews?/i);
-                if (m) rev = parseInt(m[1].replace(/,/g, ''), 10);
-            }
-            if (!rev) {
-                const mParen = f7.innerText.match(/\(\s*([\d,]+)\s*\)/);
-                if (mParen) rev = parseInt(mParen[1].replace(/,/g, ''), 10);
-            }
-
-            if (r !== null && rev !== null) {
-                return { rating: r, reviews: rev, method: 'maps' };
+            if (r !== null || rev !== null) {
+                return { title: mainTitleEl.innerText, rating: r, reviews: rev, method: 'maps_place_page' };
             }
         }
 
-        // --- 2. Google Search Knowledge Graph ---
+        // --- 2. Maps Search Result Cards: strictly match card with brand name ---
+        const cards = document.querySelectorAll('div.Nv2PK, div[role="article"]');
+        for (const card of cards) {
+            const titleEl = card.querySelector('.qBF1Pd, .fontHeadlineSmall');
+            if (titleEl && (!brandLower || titleEl.innerText.toLowerCase().includes(brandLower))) {
+                let r = null, rev = null;
+                const zk = card.querySelector('span.ZkP5Je');
+                if (zk) {
+                    const label = zk.getAttribute('aria-label') || '';
+                    const mLabel = label.match(/([\d.]+)\s*stars?\s*([\d,]+)\s*reviews?/i);
+                    if (mLabel) {
+                        r = parseFloat(mLabel[1]);
+                        rev = parseInt(mLabel[2].replace(/,/g, ''), 10);
+                    }
+                }
+                if (r === null) {
+                    const rEl = card.querySelector('span.MW4etd');
+                    if (rEl && /^\d\.\d$/.test(rEl.innerText.trim())) r = parseFloat(rEl.innerText.trim());
+                }
+                if (rev === null) {
+                    const revEl = card.querySelector('span.UY7F9');
+                    if (revEl) {
+                        const m = revEl.innerText.match(/([\d,]+)/);
+                        if (m) rev = parseInt(m[1].replace(/,/g, ''), 10);
+                    }
+                }
+                if (r !== null || rev !== null) {
+                    return { title: titleEl.innerText, rating: r, reviews: rev, method: 'maps_brand_search_card' };
+                }
+            }
+        }
+
+        // --- 3. Google Search Knowledge Graph ---
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
         let revNode = null;
         let revCount = null;
@@ -133,6 +191,7 @@ def extract_gmb_data(page):
         }
 
         if (revNode && revCount !== null) {
+            let reviews = revCount;
             let block = revNode.closest('[data-attrid*="place_ratings"], .Ob27yc');
             if (!block) {
                 let p = revNode.parentElement;
@@ -149,14 +208,11 @@ def extract_gmb_data(page):
             }
 
             let rating = null;
-
             const ariaEl = block.querySelector('[aria-label*="Rated"], [aria-label*="out of 5"]');
             if (ariaEl) {
                 const label = ariaEl.getAttribute('aria-label') || '';
                 const mRate = label.match(/Rated\s*(\d\.\d)\s*out of 5/i) || label.match(/(\d\.\d)\s*out of 5/i);
-                if (mRate) {
-                    rating = parseFloat(mRate[1]);
-                }
+                if (mRate) rating = parseFloat(mRate[1]);
             }
 
             if (rating === null) {
@@ -183,28 +239,26 @@ def extract_gmb_data(page):
             if (rating === null) {
                 const blockText = block.innerText || '';
                 const mPattern = blockText.match(/(\d\.\d)\s*[\r\n\s]*★*[\r\n\s]*[\d,]+\s*Google\s*reviews?/i);
-                if (mPattern) {
-                    rating = parseFloat(mPattern[1]);
-                }
+                if (mPattern) rating = parseFloat(mPattern[1]);
             }
 
-            return { rating: rating, reviews: revCount, method: 'knowledge_graph' };
+            return { title: 'Knowledge Graph', rating, reviews, method: 'knowledge_graph' };
         }
 
-        return { rating: null, reviews: null, method: 'none' };
+        return { title: null, rating: null, reviews: null, method: 'none' };
     }
     """
 
     try:
-        data = page.evaluate(js_code)
-        if data and data.get("rating") is not None and data.get("reviews") is not None:
-            return data["rating"], data["reviews"]
+        data = page.evaluate(js_code, brand)
+        if data and (data.get("rating") is not None or data.get("reviews") is not None):
+            return data.get("rating"), data.get("reviews")
     except Exception as e:
         print(f"    [Evaluate error] {e}")
 
     # Fallback to pure regex parser
     r_re, rev_re = parse_with_regex_fallback(page.content())
-    if r_re is not None and rev_re is not None:
+    if r_re is not None or rev_re is not None:
         return r_re, rev_re
 
     return None, None
@@ -219,31 +273,55 @@ def scrape_store(page, store_code, brand, address, link):
 
     # Step 1: Open direct link
     try:
-        page.goto(link, timeout=40000, wait_until="domcontentloaded")
+        page.goto(link, timeout=30000, wait_until="domcontentloaded")
         page.wait_for_timeout(3500)
-        rating, reviews = extract_gmb_data(page)
+        rating, reviews = extract_gmb_data(page, brand=brand)
     except Exception as e:
         error_msg = str(e)
         print(f"  [Direct link warning] {e}")
 
-    # Step 2: Fallback search if rating or reviews were not captured
+    # Step 2: Fallback direct Google Maps search with brand validation
     if rating is None or reviews is None:
-        clean_addr = address.replace(",", " ").strip()
-        search_query = f"{brand} {clean_addr}"
-        search_url = f"https://www.google.com/search?q={search_query.replace(' ', '+')}&hl=en"
-        print(f"  [Fallback Search] Querying: {search_url}")
+        c_addr = clean_address(address)
+        search_query = urllib.parse.quote(f"{brand} {c_addr}")
+        maps_search_url = f"https://www.google.com/maps/search/{search_query}?hl=en"
+        print(f"  [Fallback Maps Search] Querying: {maps_search_url}")
         try:
-            page.goto(search_url, timeout=40000, wait_until="domcontentloaded")
-            page.wait_for_timeout(3500)
-            f_rating, f_reviews = extract_gmb_data(page)
+            page.goto(maps_search_url, timeout=35000, wait_until="domcontentloaded")
+            page.wait_for_timeout(4500)
+            f_rating, f_reviews = extract_gmb_data(page, brand=brand)
             if f_rating is not None and rating is None:
                 rating = f_rating
             if f_reviews is not None and reviews is None:
                 reviews = f_reviews
         except Exception as e:
-            print(f"  [Fallback warning] {e}")
+            print(f"  [Fallback Maps warning] {e}")
+
+    # Step 3: Secondary search on Google Web Search only if Maps returned nothing
+    if rating is None and reviews is None:
+        c_addr = clean_address(address)
+        web_search_url = f"https://www.google.com/search?q={urllib.parse.quote(f'{brand} {c_addr}')}&hl=en"
+        print(f"  [Secondary Web Search] Querying: {web_search_url}")
+        try:
+            page.goto(web_search_url, timeout=35000, wait_until="domcontentloaded")
+            page.wait_for_timeout(3500)
+            f_rating, f_reviews = extract_gmb_data(page, brand=brand)
+            if f_rating is not None and rating is None:
+                rating = f_rating
+            if f_reviews is not None and reviews is None:
+                reviews = f_reviews
+        except Exception as e:
+            print(f"  [Secondary Web warning] {e}")
 
     print(f"  -> Result: GMB Live Rating = {rating} | Review Count = {reviews}")
+
+    if rating is not None and reviews is not None:
+        status = "success"
+    elif rating is not None or reviews is not None:
+        status = "partial"
+    else:
+        status = "failed"
+
     return {
         "store_code": store_code,
         "brand": brand,
@@ -251,7 +329,7 @@ def scrape_store(page, store_code, brand, address, link):
         "link": link,
         "rating": rating,
         "reviews": reviews,
-        "status": "success" if (rating is not None and reviews is not None) else "failed",
+        "status": status,
         "error": error_msg
     }
 
@@ -400,12 +478,34 @@ def run():
                 "Accept-Language": "en-US,en;q=0.9"
             }
         )
+
+        # Inject consent cookies to bypass Google consent interstitial in all regions
+        try:
+            context.add_cookies([
+                {"name": "SOCS", "value": "CAESEwgDEgk2NDg5ODc0NDQaAmVuIAEaBgiA_LyaBg", "domain": ".google.com", "path": "/"},
+                {"name": "CONSENT", "value": "PENDING+999", "domain": ".google.com", "path": "/"}
+            ])
+        except Exception as e:
+            print(f"  [Cookie notice] {e}")
+
+        # Anti-bot stealth init script
+        context.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+        """)
+
         page = context.new_page()
 
-        for s in stores:
+        for idx, s in enumerate(stores):
             res = scrape_store(page, s["code"], s["brand"], s["address"], s["link"])
             results.append(res)
-            time.sleep(2)
+            
+            # Human-like pacing between stores
+            if idx < len(stores) - 1:
+                delay = random.uniform(2.5, 4.0)
+                time.sleep(delay)
 
         browser.close()
 
@@ -416,6 +516,7 @@ def run():
         "date": datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
         "total_stores": len(stores),
         "successful": sum(1 for r in results if r["status"] == "success"),
+        "partial": sum(1 for r in results if r["status"] == "partial"),
         "failed": sum(1 for r in results if r["status"] == "failed"),
         "results": results
     }

@@ -40,8 +40,16 @@ def build_html_body(data):
         rating_display = f"{rating} ★" if rating is not None else "<span style='color:#e06666;'>N/A</span>"
         reviews_display = f"{reviews:,}" if reviews is not None else "<span style='color:#e06666;'>N/A</span>"
         
-        badge_color = "#38761d" if status == "success" else "#cc0000"
-        status_badge = f"<span style='color:{badge_color}; font-weight:600;'>{status.upper()}</span>"
+        if status == "success":
+            badge_color = "#38761d"
+            status_text = "SUCCESS"
+        elif status == "partial":
+            badge_color = "#b45f06"
+            status_text = "PARTIAL"
+        else:
+            badge_color = "#cc0000"
+            status_text = "FAILED"
+        status_badge = f"<span style='color:{badge_color}; font-weight:600;'>{status_text}</span>"
 
         row_bg = "#ffffff" if idx % 2 != 0 else "#f9f9f9"
         rows_html += f"""
